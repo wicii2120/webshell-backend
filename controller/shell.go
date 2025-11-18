@@ -1,10 +1,17 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"math/rand"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -17,6 +24,62 @@ import (
 	"webshell/websocket/service/shell"
 	"webshell/websocket/service/upload"
 )
+
+type hostStruct struct {
+	host string
+	port int
+}
+
+var configuredHosts []hostStruct
+
+func parseHostString(s string) (host string, port int, err error) {
+	split := strings.SplitN(s, ":", 2)
+	if len(split) == 0 {
+		err = errors.New("invalid host string")
+		return "", 0, err
+	}
+	if len(split) == 1 {
+		host = split[0]
+		return host, 22, nil
+	}
+	host = split[0]
+	port, err = strconv.Atoi(split[1])
+	if err != nil {
+		err = errors.New("invalid host string")
+		return "", 0, err
+	}
+	return host, port, nil
+}
+
+func getConfiguredHosts() (hosts []hostStruct, resErr error) {
+	if len(configuredHosts) > 0 {
+		hosts = configuredHosts
+		return
+	}
+
+	ev := os.Getenv("SSH_HOSTS")
+	if ev == "" {
+		err := errors.New("no configured ssh host")
+		log.Println(err)
+		resErr = err
+		return
+	}
+	hostStrings := strings.Split(ev, ",")
+	for _, hs := range hostStrings {
+		h, p, err := parseHostString(hs)
+		if err != nil {
+			resErr = err
+			log.Println(err)
+			return
+		}
+		hosts = append(hosts, hostStruct{
+			host: h,
+			port: p,
+		})
+	}
+	configuredHosts = hosts
+	return
+}
 
 func StartLocalShell(c *gin.Context) {
 	var req struct {
@@ -63,10 +126,63 @@ func NewSSHController() *SSHController {
 }
 
 type sshInfo struct {
-	Host     string `json:"host" binding:"required"`
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
+	Host     string `json:"host"`
 	Port     int    `json:"port"`
+}
+
+func dialSSH(addr string, config *ssh.ClientConfig) (client *ssh.Client, err error) {
+	const maxAttempts = 3
+	delay := 200 * time.Millisecond
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		client, err = ssh.Dial("tcp", addr, config)
+		if err == nil {
+			return client, err
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		fmt.Printf("dial failed (attempt %d/%d): %v, retrying in %v\n",
+			attempt, maxAttempts, err, delay)
+		time.Sleep(delay)
+		delay *= 2
+	}
+	return nil, fmt.Errorf("dial failed after %d attempts: %w", maxAttempts, err)
+}
+
+func getSSHClient(info *sshInfo, config *ssh.ClientConfig) (client *ssh.Client, err error) {
+	if info.Host != "" {
+		if info.Port == 0 {
+			info.Port = 22
+		}
+		return dialSSH(fmt.Sprintf("%s:%d", info.Host, info.Port), config)
+	}
+	hosts, err := getConfiguredHosts()
+	if err != nil {
+		return nil, err
+	}
+	if len(hosts) == 0 {
+		return nil, errors.New("no configured hosts available")
+	}
+
+	const maxHostsToTry = 3
+	randSrc := rand.New(rand.NewSource(time.Now().UnixNano()))
+	perm := randSrc.Perm(len(hosts))
+	tries := min(len(hosts), maxHostsToTry)
+
+	for i := range tries {
+		h := hosts[perm[i]]
+		addr := fmt.Sprintf("%s:%d", h.host, h.port)
+		client, err = dialSSH(addr, config)
+		if err == nil {
+			return client, nil
+		}
+		log.Printf("failed to dial host %s: %v", addr, err)
+	}
+
+	return nil, fmt.Errorf("failed to dial any configured host after %d attempts: %w", tries, err)
 }
 
 func (sc *SSHController) LoginSSH(c *gin.Context) {
@@ -93,7 +209,7 @@ func (sc *SSHController) LoginSSH(c *gin.Context) {
 		return
 	}
 
-	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", sshInfo.Host, sshInfo.Port), config)
+	client, err := getSSHClient(&sshInfo, config)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
