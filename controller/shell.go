@@ -33,7 +33,7 @@ type hostStruct struct {
 var configuredHosts []hostStruct
 
 func parseHostString(s string) (host string, port int, err error) {
-	split := strings.SplitN(s, ":", 2)
+	split := strings.SplitN(strings.TrimSpace(s), ":", 2)
 	if len(split) == 0 {
 		err = errors.New("invalid host string")
 		return "", 0, err
