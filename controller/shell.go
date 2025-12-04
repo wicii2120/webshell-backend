@@ -30,55 +30,69 @@ type hostStruct struct {
 	port int
 }
 
-var configuredHosts []hostStruct
+var (
+	configuredHosts    []hostStruct
+	configuredKeyFiles []string
+)
 
-func parseHostString(s string) (host string, port int, err error) {
+func parseHostString(s string) (host string, port int) {
 	split := strings.SplitN(strings.TrimSpace(s), ":", 2)
 	if len(split) == 0 {
-		err = errors.New("invalid host string")
-		return "", 0, err
+		log.Println("ssh: invalid host config")
+		return "", 0
 	}
 	if len(split) == 1 {
 		host = split[0]
-		return host, 22, nil
+		return host, 22
 	}
 	host = split[0]
-	port, err = strconv.Atoi(split[1])
+	port, err := strconv.Atoi(split[1])
 	if err != nil {
-		err = errors.New("invalid host string")
-		return "", 0, err
+		log.Printf("ssh: invalid host config: %v", err)
+		return "", 0
 	}
-	return host, port, nil
+	return host, port
 }
 
-func getConfiguredHosts() (hosts []hostStruct, resErr error) {
+func getConfiguredHosts() (hosts []hostStruct) {
 	if len(configuredHosts) > 0 {
 		hosts = configuredHosts
-		return
+		return configuredHosts
 	}
 
 	ev := os.Getenv("SSH_HOSTS")
 	if ev == "" {
-		err := errors.New("no configured ssh host")
-		log.Println(err)
-		resErr = err
-		return
+		return nil
 	}
 	hostStrings := strings.Split(ev, ",")
 	for _, hs := range hostStrings {
-		h, p, err := parseHostString(hs)
-		if err != nil {
-			resErr = err
-			log.Println(err)
-			return
+		h, p := parseHostString(hs)
+		if h != "" {
+			hosts = append(hosts, hostStruct{
+				host: h,
+				port: p,
+			})
 		}
-		hosts = append(hosts, hostStruct{
-			host: h,
-			port: p,
-		})
 	}
 	configuredHosts = hosts
 	return
+}
+
+func getConfiguredKeyFiles() []string {
+	if len(configuredKeyFiles) > 0 {
+		return configuredKeyFiles
+	}
+
+	ev := os.Getenv("SSH_KEY_FILES")
+	if ev == "" {
+		return nil
+	}
+	keyFiles := strings.Split(ev, ",")
+	for i, kf := range keyFiles {
+		keyFiles[i] = strings.TrimSpace(kf)
+	}
+	configuredKeyFiles = keyFiles
+	return configuredKeyFiles
 }
 
 func StartLocalShell(c *gin.Context) {
@@ -127,7 +141,7 @@ func NewSSHController() *SSHController {
 
 type sshInfo struct {
 	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Password string `json:"password"`
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
 }
@@ -159,12 +173,9 @@ func getSSHClient(info *sshInfo, config *ssh.ClientConfig) (client *ssh.Client, 
 		}
 		return dialSSH(fmt.Sprintf("%s:%d", info.Host, info.Port), config)
 	}
-	hosts, err := getConfiguredHosts()
-	if err != nil {
-		return nil, err
-	}
+	hosts := getConfiguredHosts()
 	if len(hosts) == 0 {
-		return nil, errors.New("no configured hosts available")
+		return nil, errors.New("ssh: no host passed in request or config")
 	}
 
 	const maxHostsToTry = 3
@@ -179,10 +190,10 @@ func getSSHClient(info *sshInfo, config *ssh.ClientConfig) (client *ssh.Client, 
 		if err == nil {
 			return client, nil
 		}
-		log.Printf("failed to dial host %s: %v", addr, err)
+		log.Printf("ssh: failed to dial host %s: %v", addr, err)
 	}
 
-	return nil, fmt.Errorf("failed to dial any configured host after %d attempts: %w", tries, err)
+	return nil, fmt.Errorf("ssh: failed to dial any configured host after %d attempts: %w", tries, err)
 }
 
 func (sc *SSHController) LoginSSH(c *gin.Context) {
@@ -202,11 +213,28 @@ func (sc *SSHController) LoginSSH(c *gin.Context) {
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Note: In production, use proper host key verification
 	}
 
-	if sshInfo.Password != "" {
-		config.Auth = append(config.Auth, ssh.Password(sshInfo.Password))
-	} else {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No authentication method provided"})
-		return
+	config.Auth = append(config.Auth, ssh.Password(sshInfo.Password))
+
+	// Load key files from config
+	{
+		keyFiles := getConfiguredKeyFiles()
+		var signers []ssh.Signer
+		for _, kf := range keyFiles {
+			keyData, err := os.ReadFile(kf)
+			if err != nil {
+				log.Printf("ssh: failed to read key file %s: %v", kf, err)
+				continue
+			}
+			signer, err := ssh.ParsePrivateKey(keyData)
+			if err != nil {
+				log.Printf("ssh: failed to parse key file %s: %v", kf, err)
+				continue
+			}
+			signers = append(signers, signer)
+		}
+		if len(signers) > 0 {
+			config.Auth = append(config.Auth, ssh.PublicKeys(signers...))
+		}
 	}
 
 	client, err := getSSHClient(&sshInfo, config)
